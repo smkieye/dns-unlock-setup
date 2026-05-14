@@ -332,6 +332,8 @@ if core == 'sing-box':
     if strategy:
         dns['strategy'] = strategy
     data['dns'] = dns
+    if isinstance(data.get('route'), dict):
+        data['route']['default_domain_resolver'] = tag
     # Replace route-specific prefer_ipv6 when IPv4-only was requested.
     if strategy == 'ipv4_only':
         def walk(x):
@@ -373,45 +375,102 @@ patch_singbox() {
   log "检测到 sing-box 配置，尝试写入 DNS 策略：$strategy"
   for p in "${paths[@]}"; do
     if [[ -d "$p" ]]; then
-      local dnsfile="$p/00_dns_unlock.json"
-      cat > "$dnsfile" <<EOF
-{
-  "dns": {
-    "servers": [
-      {
-        "type": "udp",
-        "tag": "dns-unlock-local",
-        "server": "${LOCAL_DNS_IP}",
-        "server_port": ${LOCAL_DNS_PORT}
-      }
-    ],
-    "final": "dns-unlock-local"$( [[ -n "$strategy" ]] && printf ',\n    "strategy": "%s"' "$strategy" )
-  }
-}
-EOF
-      log "已写入 sing-box 多文件 DNS：$dnsfile"
-      if [[ "$strategy" == "ipv4_only" ]]; then
-        grep -RIl 'prefer_ipv6' "$p" 2>/dev/null | while read -r f; do
-          python3 - "$f" <<'PY'
-import sys, pathlib
-p=pathlib.Path(sys.argv[1])
-s=p.read_text(errors='ignore')
-ns=s.replace('"prefer_ipv6"','"ipv4_only"')
-if ns!=s:
-    p.write_text(ns)
-    print(f"replaced prefer_ipv6 in {p}")
+      python3 - "$p" "$strategy" "$LOCAL_DNS_IP" "$LOCAL_DNS_PORT" <<'PY'
+import json, pathlib, sys
+conf_dir = pathlib.Path(sys.argv[1])
+strategy, ip, port = sys.argv[2:5]
+tag = 'dns-unlock-local'
+
+def load_json(path):
+    try:
+        text = path.read_text(encoding='utf-8')
+        # sing-box accepts JSONC in some builds; ignore files with leading // comments here.
+        if text.lstrip().startswith('//'):
+            return None
+        return json.loads(text)
+    except Exception:
+        return None
+
+def save_json(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=4) + '\n', encoding='utf-8')
+
+def patch_dns_obj(data):
+    dns = data.get('dns') if isinstance(data.get('dns'), dict) else {}
+    dns['servers'] = [{'type': 'udp', 'tag': tag, 'server': ip, 'server_port': int(port)}]
+    dns['final'] = tag
+    if strategy:
+        dns['strategy'] = strategy
+    data['dns'] = dns
+
+def patch_route_obj(data):
+    route = data.get('route') if isinstance(data.get('route'), dict) else None
+    if route is None:
+        return False
+    route['default_domain_resolver'] = tag
+    if strategy == 'ipv4_only':
+        def walk(x):
+            if isinstance(x, dict):
+                for k, v in list(x.items()):
+                    if k == 'strategy' and v == 'prefer_ipv6':
+                        x[k] = 'ipv4_only'
+                    else:
+                        walk(v)
+            elif isinstance(x, list):
+                for i in x:
+                    walk(i)
+        walk(route)
+    return True
+
+json_files = sorted(conf_dir.glob('*.json'))
+dns_files = []
+route_files = []
+for f in json_files:
+    if f.name.endswith('.disabled'):
+        continue
+    data = load_json(f)
+    if not isinstance(data, dict):
+        continue
+    if isinstance(data.get('dns'), dict):
+        dns_files.append((f, data))
+    if isinstance(data.get('route'), dict):
+        route_files.append((f, data))
+
+# Important: in sing-box -C multi-file configs, later files can override earlier
+# top-level dns blocks. Patch existing DNS files instead of adding 00_dns_unlock.json.
+if dns_files:
+    for f, data in dns_files:
+        patch_dns_obj(data)
+        save_json(f, data)
+        print(f'PATCHED sing-box DNS {f}')
+    old = conf_dir / '00_dns_unlock.json'
+    if old.exists():
+        old.rename(conf_dir / '00_dns_unlock.json.disabled')
+        print(f'DISABLED obsolete {old}')
+else:
+    dnsfile = conf_dir / '99_dns_unlock.json'
+    data = {}
+    patch_dns_obj(data)
+    save_json(dnsfile, data)
+    print(f'WROTE sing-box DNS {dnsfile}')
+
+for f, data in route_files:
+    patch_route_obj(data)
+    save_json(f, data)
+    print(f'PATCHED sing-box route resolver {f}')
 PY
-        done
-      fi
     elif [[ -f "$p" && "$p" == *.json ]]; then
       patch_json_dns "$p" "sing-box" "$strategy"
     fi
   done
   if command -v sing-box >/dev/null 2>&1; then
+    local check_failed=0
     for p in "${paths[@]}"; do
-      if [[ -d "$p" ]]; then sing-box check -C "$p" || warn "sing-box check -C $p 未通过，请查看输出。"; fi
-      if [[ -f "$p" ]]; then sing-box check -c "$p" || warn "sing-box check -c $p 未通过，请查看输出。"; fi
+      if [[ -d "$p" ]]; then sing-box check -C "$p" || { warn "sing-box check -C $p 未通过；为避免代理中断，将跳过自动重启 sing-box。"; check_failed=1; }; fi
+      if [[ -f "$p" ]]; then sing-box check -c "$p" || { warn "sing-box check -c $p 未通过；为避免代理中断，将跳过自动重启 sing-box。"; check_failed=1; }; fi
     done
+    if [[ "$check_failed" -eq 1 ]]; then
+      RESTART_PROXY_CORE="no"
+    fi
   fi
 }
 
