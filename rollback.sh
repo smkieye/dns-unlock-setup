@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# DNS Unlock / Disney playback fix rollback script
-# Safe default: create a current-state backup, then restore selected previous backup,
-# remove dnsproxy/systemd-resolved unlock drop-ins, and remove Disney QUIC block.
+# Brute-force rollback / uninstall for dns-unlock-setup.
+# Goals:
+# - Remove installed dnsproxy program/config/service and DNS-unlock artifacts.
+# - Keep all backup directories/files intact.
+# - Restore Linux IPv4/IPv6 behavior to normal dual-stack defaults.
+# - Set system DNS to 1.1.1.1 and 8.8.8.8; if the server has IPv6 connectivity,
+#   also add IPv6 public DNS so AAAA resolution works normally.
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info(){ printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
@@ -18,194 +22,218 @@ need_root(){
   fi
 }
 
-pause_confirm(){
+confirm(){
   local ans
-  printf "\n${YELLOW}即将回滚 DNS 解锁/Disney 修复相关配置。继续吗？输入 YES 继续：${NC} " >/dev/tty
+  printf "\n${YELLOW}本脚本将简单粗暴卸载 DNS 解锁相关程序/服务/配置，但保留所有备份目录。继续请输入 YES：${NC} " >/dev/tty
   read -r ans </dev/tty || true
   [[ "$ans" == "YES" ]] || { warn "已取消。"; exit 0; }
 }
 
 make_safety_backup(){
-  SAFETY="/root/dns-unlock-rollback-safety-$(date +%Y%m%d-%H%M%S)"
+  SAFETY="/root/dns-unlock-brutal-rollback-safety-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$SAFETY"
-  info "先备份当前状态到：$SAFETY"
-  cp -a /etc/sing-box "$SAFETY/sing-box" 2>/dev/null || true
+  info "先备份当前关键状态到：$SAFETY"
   cp -a /etc/dnsproxy "$SAFETY/dnsproxy" 2>/dev/null || true
+  cp -a /etc/systemd/system/dnsproxy-doh.service "$SAFETY/dnsproxy-doh.service" 2>/dev/null || true
   cp -a /etc/systemd/resolved.conf "$SAFETY/resolved.conf" 2>/dev/null || true
   cp -a /etc/systemd/resolved.conf.d "$SAFETY/resolved.conf.d" 2>/dev/null || true
-  cp -a /etc/systemd/system/dnsproxy-doh.service "$SAFETY/dnsproxy-doh.service" 2>/dev/null || true
+  cp -a /etc/resolv.conf "$SAFETY/resolv.conf" 2>/dev/null || true
+  cp -a /etc/sysctl.conf "$SAFETY/sysctl.conf" 2>/dev/null || true
+  cp -a /etc/sysctl.d "$SAFETY/sysctl.d" 2>/dev/null || true
   cp -a /etc/nftables.conf "$SAFETY/nftables.conf" 2>/dev/null || true
+  cp -a /etc/sing-box/conf/00_dns_unlock.json "$SAFETY/00_dns_unlock.json" 2>/dev/null || true
+  cp -a /etc/sing-box/conf/00_dns_unlock.json.disabled "$SAFETY/00_dns_unlock.json.disabled" 2>/dev/null || true
   nft list ruleset > "$SAFETY/nft-ruleset.txt" 2>/dev/null || true
 }
 
-find_backups(){
-  mapfile -t BACKUPS < <(
-    for d in \
-      /root/dns-unlock-backup-* \
-      /root/dns-unlock-setup-backup-* \
-      /root/dns-unlock-fix-backup-* \
-      /root/disney-playback-fix-backup-*; do
-      [[ -d "$d" ]] && echo "$d"
-    done | sort
-  )
+has_ipv6_default_route(){
+  ip -6 route show default 2>/dev/null | grep -q .
 }
 
-describe_backup(){
-  local d="$1"; local marks=()
-  [[ -d "$d/sing-box" || -d "$d/sing-box-conf" ]] && marks+=("sing-box")
-  [[ -d "$d/dnsproxy" ]] && marks+=("dnsproxy")
-  [[ -f "$d/resolved.conf" || -d "$d/resolved.conf.d" ]] && marks+=("resolved")
-  [[ -f "$d/nftables.conf" || -f "$d/nft-ruleset.before" || -f "$d/nft-ruleset.txt" ]] && marks+=("nft")
-  [[ ${#marks[@]} -eq 0 ]] && printf "未知内容" || printf "%s" "${marks[*]}"
-}
-
-choose_backup(){
-  find_backups
-  SELECTED_BACKUP=""
-  if [[ ${#BACKUPS[@]} -eq 0 ]]; then
-    warn "未找到 /root/dns-unlock* 或 /root/disney-playback* 备份目录。将执行“尽力撤销”模式。"
-    return 0
-  fi
-
-  printf "\n${BLUE}找到以下备份目录：${NC}\n" >/dev/tty
-  local i=1
-  for d in "${BACKUPS[@]}"; do
-    printf "  %2d) %s  [%s]\n" "$i" "$d" "$(describe_backup "$d")" >/dev/tty
-    ((i++))
-  done
-  printf "   0) 不从备份恢复，只撤销 DNS 解锁/QUIC 阻断改动\n" >/dev/tty
-
-  printf "\n${YELLOW}建议：如果要回到最初状态，选择最早的 dns-unlock-backup / dns-unlock-setup-backup。${NC}\n" >/dev/tty
-  printf "请选择备份编号 [默认 1]: " >/dev/tty
-  local ans
-  read -r ans </dev/tty || true
-  ans="${ans:-1}"
-  if [[ "$ans" == "0" ]]; then
-    SELECTED_BACKUP=""
-    return 0
-  fi
-  if ! [[ "$ans" =~ ^[0-9]+$ ]] || (( ans < 1 || ans > ${#BACKUPS[@]} )); then
-    err "无效编号：$ans"
-    exit 1
-  fi
-  SELECTED_BACKUP="${BACKUPS[$((ans-1))]}"
-  ok "将从备份恢复：$SELECTED_BACKUP"
-}
-
-restore_path(){
-  local src="$1" dst="$2"
-  if [[ -e "$src" ]]; then
-    info "恢复 $dst <- $src"
-    rm -rf "$dst"
-    mkdir -p "$(dirname "$dst")"
-    cp -a "$src" "$dst"
-  fi
-}
-
-restore_from_backup(){
-  local b="$1"
-  [[ -n "$b" ]] || return 0
-
-  # sing-box: some backups store full /etc/sing-box, others only conf.
-  if [[ -d "$b/sing-box" ]]; then
-    restore_path "$b/sing-box" /etc/sing-box
-  elif [[ -d "$b/sing-box-conf" ]]; then
-    restore_path "$b/sing-box-conf" /etc/sing-box/conf
-  fi
-
-  # Other proxy cores, if present in backup.
-  [[ -d "$b/xray" ]] && restore_path "$b/xray" /etc/xray
-  [[ -d "$b/v2ray" ]] && restore_path "$b/v2ray" /etc/v2ray
-  [[ -d "$b/mihomo" ]] && restore_path "$b/mihomo" /etc/mihomo
-  [[ -d "$b/clash" ]] && restore_path "$b/clash" /etc/clash
-
-  [[ -d "$b/dnsproxy" ]] && restore_path "$b/dnsproxy" /etc/dnsproxy
-  [[ -f "$b/resolved.conf" ]] && restore_path "$b/resolved.conf" /etc/systemd/resolved.conf
-  [[ -d "$b/resolved.conf.d" ]] && restore_path "$b/resolved.conf.d" /etc/systemd/resolved.conf.d
-  [[ -f "$b/nftables.conf" ]] && restore_path "$b/nftables.conf" /etc/nftables.conf
-}
-
-remove_unlock_artifacts(){
-  info "撤销 DNS 解锁脚本常见残留配置"
-
-  # Stop/disable dnsproxy-doh installed by the unlock script.
+remove_dnsproxy(){
+  info "停止并移除 dnsproxy-doh 服务、dnsproxy 程序和配置"
   systemctl stop dnsproxy-doh.service 2>/dev/null || true
   systemctl disable dnsproxy-doh.service 2>/dev/null || true
   rm -f /etc/systemd/system/dnsproxy-doh.service
+  rm -f /etc/systemd/system/multi-user.target.wants/dnsproxy-doh.service
+  rm -rf /etc/dnsproxy
+  rm -f /usr/local/bin/dnsproxy
   systemctl daemon-reload || true
+}
 
-  # Remove common systemd-resolved drop-ins added by our scripts.
+remove_resolved_unlock_dropins(){
+  info "删除 DNS 解锁相关 systemd-resolved drop-in"
   rm -f \
     /etc/systemd/resolved.conf.d/10-gaidns-doh.conf \
     /etc/systemd/resolved.conf.d/10-dns-unlock.conf \
     /etc/systemd/resolved.conf.d/10-dns-unlock-setup.conf \
     /etc/systemd/resolved.conf.d/99-dns-unlock.conf 2>/dev/null || true
+}
 
-  # Remove the extra early sing-box DNS file created by older one-click versions.
-  rm -f /etc/sing-box/conf/00_dns_unlock.json /etc/sing-box/conf/00_dns_unlock.json.disabled 2>/dev/null || true
+restore_ipv4_ipv6_defaults(){
+  info "恢复 Linux IPv4/IPv6 默认行为：启用 IPv4/IPv6，不再禁用 IPv6/AAAA"
 
-  # Runtime remove Disney QUIC block table without flushing Docker/fail2ban rules.
-  if command -v nft >/dev/null 2>&1; then
-    nft delete table inet disney_quic_block 2>/dev/null || true
+  # Runtime sysctl: enable IPv6 back immediately. Ignore unsupported keys.
+  sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
+
+  # Remove common files/drop-ins created by DNS unlock scripts to disable IPv6.
+  rm -f \
+    /etc/sysctl.d/99-disable-ipv6.conf \
+    /etc/sysctl.d/99-dns-unlock-ipv6.conf \
+    /etc/sysctl.d/99-dns-unlock-disable-ipv6.conf \
+    /etc/sysctl.d/10-disable-ipv6.conf 2>/dev/null || true
+
+  # If /etc/sysctl.conf contains disable_ipv6 lines, comment them instead of deleting the file.
+  if [[ -f /etc/sysctl.conf ]]; then
+    sed -i -E 's/^([[:space:]]*net\.ipv6\.conf\..*\.disable_ipv6[[:space:]]*=.*)$/# dns-unlock rollback commented: \1/' /etc/sysctl.conf || true
   fi
 
-  # If nftables.conf is exactly/mostly our Disney block and no backup restored it, move it aside.
-  if [[ -f /etc/nftables.conf ]] && grep -q 'disney_quic_block' /etc/nftables.conf; then
-    mv /etc/nftables.conf "/etc/nftables.conf.removed-by-dns-rollback-$(date +%Y%m%d-%H%M%S)"
-    warn "已移除包含 disney_quic_block 的 /etc/nftables.conf；如果你原本有自定义 nftables，请从安全备份恢复。"
+  # Re-enable IPv6 via GRUB/sysctl common kernel parameters if our scripts added them.
+  if [[ -f /etc/default/grub ]]; then
+    sed -i -E 's/[[:space:]]*ipv6\.disable=1//g; s/[[:space:]]*net\.ipv6\.conf\.all\.disable_ipv6=1//g' /etc/default/grub || true
+    if command -v update-grub >/dev/null 2>&1; then
+      update-grub >/dev/null 2>&1 || true
+    fi
   fi
 }
 
-restart_and_verify(){
-  info "重启/验证服务"
-  systemctl restart systemd-resolved 2>/dev/null || true
+configure_public_dns(){
+  info "恢复系统 DNS 到公共 DNS：1.1.1.1、8.8.8.8；双栈服务器额外加入 IPv6 DNS"
+  mkdir -p /etc/systemd/resolved.conf.d
 
-  if [[ -x /etc/sing-box/sing-box && -d /etc/sing-box/conf ]]; then
-    if (cd /etc/sing-box && ./sing-box check -C /etc/sing-box/conf >/tmp/sing-box-rollback-check.log 2>&1); then
-      ok "sing-box 配置检查通过"
-      systemctl restart sing-box 2>/dev/null || true
-    else
-      warn "sing-box 配置检查失败，未主动重启 sing-box。日志：/tmp/sing-box-rollback-check.log"
-    fi
-  elif command -v sing-box >/dev/null 2>&1 && [[ -d /etc/sing-box/conf ]]; then
-    if sing-box check -C /etc/sing-box/conf >/tmp/sing-box-rollback-check.log 2>&1; then
-      ok "sing-box 配置检查通过"
-      systemctl restart sing-box 2>/dev/null || true
-    else
-      warn "sing-box 配置检查失败，未主动重启 sing-box。日志：/tmp/sing-box-rollback-check.log"
-    fi
+  local dns_line="DNS=1.1.1.1 8.8.8.8"
+  local fallback_line="FallbackDNS=1.0.0.1 8.8.4.4"
+  if has_ipv6_default_route; then
+    dns_line="DNS=1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888"
+    fallback_line="FallbackDNS=1.0.0.1 8.8.4.4 2606:4700:4700::1001 2001:4860:4860::8844"
+    ok "检测到 IPv6 默认路由，已加入 IPv6 DNS，AAAA 解析会恢复。"
+  else
+    warn "未检测到 IPv6 默认路由，仅配置 IPv4 DNS；系统仍允许 IPv6，未来有 IPv6 路由后可解析 AAAA。"
   fi
 
-  printf "\n${BLUE}当前状态：${NC}\n"
-  systemctl is-active sing-box 2>/dev/null | sed 's/^/sing-box: /' || true
-  systemctl is-active dnsproxy-doh 2>/dev/null | sed 's/^/dnsproxy-doh: /' || true
-  systemctl is-active systemd-resolved 2>/dev/null | sed 's/^/systemd-resolved: /' || true
-  systemctl is-enabled nftables 2>/dev/null | sed 's/^/nftables enabled: /' || true
-  if command -v resolvectl >/dev/null 2>&1; then
-    resolvectl status 2>/dev/null | sed -n '1,35p' || true
+  cat > /etc/systemd/resolved.conf.d/99-public-dns.conf <<EOF
+[Resolve]
+$dns_line
+$fallback_line
+Domains=~.
+DNSStubListener=yes
+DNSSEC=no
+DNSOverTLS=no
+Cache=yes
+EOF
+
+  # Undo immutable resolv.conf if previous script set it.
+  chattr -i /etc/resolv.conf 2>/dev/null || true
+
+  # Prefer systemd-resolved stub on systemd systems.
+  if systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
+    systemctl enable systemd-resolved.service >/dev/null 2>&1 || true
+    systemctl restart systemd-resolved.service 2>/dev/null || true
+    ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+  else
+    # Fallback for non-systemd-resolved distributions.
+    {
+      echo 'nameserver 1.1.1.1'
+      echo 'nameserver 8.8.8.8'
+      if has_ipv6_default_route; then
+        echo 'nameserver 2606:4700:4700::1111'
+        echo 'nameserver 2001:4860:4860::8888'
+      fi
+    } > /etc/resolv.conf
   fi
+}
+
+remove_proxy_core_artifacts(){
+  info "删除脚本新增的代理核心 DNS 残留文件；不删除任何备份目录"
+  rm -f /etc/sing-box/conf/00_dns_unlock.json /etc/sing-box/conf/00_dns_unlock.json.disabled 2>/dev/null || true
+
+  # Do NOT aggressively rewrite 03_route.json / 05_dns.json here: those files may belong to the user's panel.
+  # The purpose is uninstalling installed artifacts and restoring system DNS/IPv6; backups are preserved for manual restore.
+}
+
+remove_quic_block(){
+  info "删除 Disney/QUIC UDP 443 阻断规则"
   if command -v nft >/dev/null 2>&1; then
-    if nft list table inet disney_quic_block >/dev/null 2>&1; then
-      warn "disney_quic_block 仍存在，请手动检查 nftables。"
+    nft delete table inet disney_quic_block 2>/dev/null || true
+  fi
+  if [[ -f /etc/nftables.conf ]] && grep -q 'disney_quic_block' /etc/nftables.conf; then
+    rm -f /etc/nftables.conf
+    systemctl disable nftables.service >/dev/null 2>&1 || true
+    systemctl stop nftables.service 2>/dev/null || true
+  fi
+}
+
+restart_proxy_if_present(){
+  if systemctl list-unit-files sing-box.service >/dev/null 2>&1; then
+    if [[ -x /etc/sing-box/sing-box && -d /etc/sing-box/conf ]]; then
+      if (cd /etc/sing-box && ./sing-box check -C /etc/sing-box/conf >/tmp/sing-box-rollback-check.log 2>&1); then
+        systemctl restart sing-box.service 2>/dev/null || true
+        ok "sing-box 配置检查通过并已重启。"
+      else
+        warn "sing-box 配置检查失败，未重启。日志：/tmp/sing-box-rollback-check.log"
+      fi
     else
-      ok "Disney UDP/443 阻断表已不存在"
+      systemctl restart sing-box.service 2>/dev/null || true
     fi
   fi
-  printf "\n${GREEN}回滚流程完成。当前状态安全备份：%s${NC}\n" "$SAFETY"
+}
+
+verify(){
+  printf "\n${BLUE}=== 回滚后状态 ===${NC}\n"
+  systemctl is-active dnsproxy-doh.service 2>/dev/null | sed 's/^/dnsproxy-doh: /' || echo 'dnsproxy-doh: not-found/inactive'
+  systemctl is-active systemd-resolved.service 2>/dev/null | sed 's/^/systemd-resolved: /' || true
+  systemctl is-active sing-box.service 2>/dev/null | sed 's/^/sing-box: /' || true
+
+  echo
+  echo '--- /etc/resolv.conf ---'
+  ls -l /etc/resolv.conf 2>/dev/null || true
+  sed -n '1,20p' /etc/resolv.conf 2>/dev/null || true
+
+  echo
+  echo '--- systemd-resolved DNS ---'
+  resolvectl status 2>/dev/null | sed -n '1,60p' || true
+
+  echo
+  echo '--- IPv6 status ---'
+  sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 2>/dev/null || true
+  ip -6 route show default 2>/dev/null || true
+
+  echo
+  echo '--- DNS smoke test ---'
+  if command -v dig >/dev/null 2>&1; then
+    echo 'A cloudflare.com:'; dig cloudflare.com A +short | sed -n '1,5p' || true
+    echo 'AAAA cloudflare.com:'; dig cloudflare.com AAAA +short | sed -n '1,5p' || true
+  else
+    getent ahosts cloudflare.com | sed -n '1,8p' || true
+  fi
+
+  if command -v nft >/dev/null 2>&1 && nft list table inet disney_quic_block >/dev/null 2>&1; then
+    warn "disney_quic_block 仍存在，请手动检查 nftables。"
+  else
+    ok "Disney QUIC 阻断表不存在。"
+  fi
+
+  printf "\n${GREEN}简单粗暴回滚完成。所有旧备份目录均未清理；本次安全备份：%s${NC}\n" "$SAFETY"
+  warn "如之前曾手动改过 sing-box 的 03_route.json/05_dns.json，脚本不会强行猜测原始内容；需要时请从保留的备份目录手动恢复。"
 }
 
 main(){
   need_root
-  echo "============================================================"
-  echo " DNS Unlock / Disney Playback Fix 回滚脚本"
-  echo "============================================================"
-  warn "该脚本会恢复备份并撤销 dnsproxy-doh、systemd-resolved 解锁 drop-in、Disney QUIC 阻断等改动。"
-  pause_confirm
+  echo '============================================================'
+  echo ' DNS Unlock Setup 简单粗暴回滚/卸载脚本'
+  echo '============================================================'
+  confirm
   make_safety_backup
-  choose_backup
-  restore_from_backup "$SELECTED_BACKUP"
-  remove_unlock_artifacts
-  restart_and_verify
+  remove_dnsproxy
+  remove_resolved_unlock_dropins
+  restore_ipv4_ipv6_defaults
+  configure_public_dns
+  remove_proxy_core_artifacts
+  remove_quic_block
+  restart_proxy_if_present
+  verify
 }
 
 main "$@"

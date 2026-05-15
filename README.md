@@ -59,9 +59,9 @@ tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/smkieye/dns-unlock
 - 持久禁用系统内核 IPv6：N
 - 给 `/etc/resolv.conf` 加 `chattr +i`：N
 
-## 回滚到安装前状态
+## 简单粗暴回滚 / 卸载
 
-如果想撤销本脚本造成的 DNS 解锁、sing-box DNS 修改、Disney/QUIC 相关修复，可以运行回滚脚本：
+如果想撤销本脚本造成的 DNS 解锁、dnsproxy 服务、Disney/QUIC 相关修复，可以运行回滚脚本：
 
 ```bash
 tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/smkieye/dns-unlock-setup/main/rollback.sh -o "$tmp" && sudo bash "$tmp"
@@ -73,9 +73,16 @@ tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/smkieye/dns-unlock
 tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/smkieye/dns-unlock-setup/main/rollback.sh -o "$tmp" && bash "$tmp"
 ```
 
-回滚脚本会先备份当前状态到 `/root/dns-unlock-rollback-safety-时间戳/`，然后列出服务器上已有的 `/root/dns-unlock-backup-*`、`/root/dns-unlock-setup-backup-*`、`/root/dns-unlock-fix-backup-*`、`/root/disney-playback-fix-backup-*` 备份目录供选择。
+回滚脚本现在采用“简单粗暴卸载”逻辑：
 
-小白建议：如果要回到最初状态，优先选择最早的 `dns-unlock-backup-*` 或 `dns-unlock-setup-backup-*`。
+- 删除 `dnsproxy-doh.service`、`/etc/dnsproxy`、`/usr/local/bin/dnsproxy`
+- 删除 DNS 解锁相关的 systemd-resolved drop-in
+- 删除脚本新增的 sing-box `00_dns_unlock.json*` 残留文件
+- 删除 Disney/QUIC 的 `disney_quic_block` nftables 规则
+- 保留所有 `/root/dns-unlock-*`、`/root/disney-playback-*` 等备份目录，不做清理
+- 恢复 Linux IPv4/IPv6 默认行为，不再禁用 IPv6/AAAA
+- 系统 DNS 恢复为 `1.1.1.1`、`8.8.8.8`
+- 如果检测到服务器有 IPv6 默认路由，会额外加入 `2606:4700:4700::1111`、`2001:4860:4860::8888`，让 AAAA 解析正常恢复
 
 ## 执行后验证
 
