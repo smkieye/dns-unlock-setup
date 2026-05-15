@@ -59,6 +59,24 @@ tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/smkieye/dns-unlock
 - 持久禁用系统内核 IPv6：N
 - 给 `/etc/resolv.conf` 加 `chattr +i`：N
 
+## 回滚到安装前状态
+
+如果想撤销本脚本造成的 DNS 解锁、sing-box DNS 修改、Disney/QUIC 相关修复，可以运行回滚脚本：
+
+```bash
+tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/smkieye/dns-unlock-setup/main/rollback.sh -o "$tmp" && sudo bash "$tmp"
+```
+
+如果你已经是 root：
+
+```bash
+tmp=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/smkieye/dns-unlock-setup/main/rollback.sh -o "$tmp" && bash "$tmp"
+```
+
+回滚脚本会先备份当前状态到 `/root/dns-unlock-rollback-safety-时间戳/`，然后列出服务器上已有的 `/root/dns-unlock-backup-*`、`/root/dns-unlock-setup-backup-*`、`/root/dns-unlock-fix-backup-*`、`/root/disney-playback-fix-backup-*` 备份目录供选择。
+
+小白建议：如果要回到最初状态，优先选择最早的 `dns-unlock-backup-*` 或 `dns-unlock-setup-backup-*`。
+
 ## 执行后验证
 
 ```bash
